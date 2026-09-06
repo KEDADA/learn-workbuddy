@@ -450,7 +450,9 @@ def select_memory_context(
     """Select and atomically pack recalled memory under explicit constraints.
 
     The order is intentional: security scope and confidence are gates; exact
-    duplicates and typed conflicts are resolved before scarce budget is spent.
+    duplicates within one fact slot and typed conflicts are resolved before
+    scarce budget is spent. Unkeyed candidates only deduplicate with other
+    unkeyed candidates; equal prose does not make different slots equivalent.
     Authority orders eligible candidates as ``current_turn`` >
     ``workspace_override`` > ``user_default``; score, source rank, capture time,
     and ID only break ties inside one authority. Top-k and budgets then pack the
@@ -499,9 +501,19 @@ def select_memory_context(
             eligible.append(candidate)
 
     deduplicated: list[MemoryContextCandidate] = []
-    content_winners: dict[str, MemoryContextCandidate] = {}
+    content_winners: dict[tuple[str | None, str], MemoryContextCandidate] = {}
     for candidate in eligible:
-        key = _normalized_memory_text(candidate.text)
+        # Keep slot identity through deduplication: dropping an equal-text
+        # record from another slot could remove that slot's authority winner
+        # and let a superseded preference survive conflict resolution.
+        # None is distinct from every explicit slot; normalize named slots
+        # exactly as the conflict stage below does.
+        normalized_slot = (
+            _normalized_memory_text(candidate.conflict_key)
+            if candidate.conflict_key is not None
+            else None
+        )
+        key = (normalized_slot, _normalized_memory_text(candidate.text))
         winner = content_winners.get(key)
         if winner is not None:
             decisions[candidate.memory_id] = _decision(
@@ -510,7 +522,10 @@ def select_memory_context(
                 reason=MemoryDecisionReason.DUPLICATE_CONTENT,
                 token_counter=token_counter,
                 related_memory_id=winner.memory_id,
-                detail=f"normalized content duplicates {winner.memory_id}",
+                detail=(
+                    f"normalized content duplicates {winner.memory_id} "
+                    f"in fact slot {normalized_slot!r}"
+                ),
             )
             continue
         content_winners[key] = candidate

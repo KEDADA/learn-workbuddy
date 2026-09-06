@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from itertools import permutations
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -175,6 +176,92 @@ def test_deduplication_and_conflict_resolution_are_stable(s15) -> None:
     assert decisions["python-copy"].related_memory_id == "python-new"
     assert decisions["typescript-old"].reason is s15.MemoryDecisionReason.CONFLICT_LOSER
     assert decisions["typescript-old"].related_memory_id == "python-new"
+
+
+@pytest.mark.parametrize("first_slot", [None, "preference:analysis-language"])
+def test_deduplication_preserves_other_slots_for_conflict_resolution(
+    s15, first_slot: str | None,
+) -> None:
+    current = candidate(
+        s15, "current-python", "Use Python", conflict_key=first_slot,
+        authority="current_turn",
+    )
+    workspace = candidate(
+        s15, "workspace-python", "Use Python",
+        conflict_key="preference:automation-language", authority="workspace_override",
+    )
+    default = candidate(
+        s15, "old-bash", "Use Bash",
+        conflict_key="preference:automation-language", authority="user_default",
+    )
+    policy = s15.MemorySelectionPolicy(max_chars=None, max_tokens=None)
+    plans = [
+        s15.select_memory_context(order, user_scope="scope-a", policy=policy)
+        for order in permutations([current, workspace, default])
+    ]
+
+    for plan in plans:
+        assert plan.selected_memory_ids == ("current-python", "workspace-python")
+        decisions = decision_by_id(plan)
+        assert decisions["old-bash"].reason is s15.MemoryDecisionReason.AUTHORITY_LOSER
+        assert decisions["old-bash"].related_memory_id == "workspace-python"
+        assert "Use Bash" not in plan.context
+        assert plan.context == plans[0].context
+        assert plan.decisions == plans[0].decisions
+
+
+@pytest.mark.parametrize(
+    "winner_slot, duplicate_slot",
+    [
+        (None, None),
+        ("preference:language", "preference:language"),
+        ("preference:language", "  ＰＲＥＦＥＲＥＮＣＥ：ＬＡＮＧＵＡＧＥ  "),
+    ],
+)
+def test_same_slot_deduplication_normalizes_text_and_slot(
+    s15, winner_slot: str | None, duplicate_slot: str | None,
+) -> None:
+    winner = candidate(
+        s15, "winner", "Use Python", conflict_key=winner_slot,
+        score=0.5, authority="workspace_override",
+    )
+    duplicate = candidate(
+        s15, "duplicate", "  ＵＳＥ   ＰＹＴＨＯＮ  ", conflict_key=duplicate_slot,
+        score=0.99, authority="user_default",
+    )
+    for order in permutations([winner, duplicate]):
+        plan = s15.select_memory_context(order, user_scope="scope-a")
+        assert plan.selected_memory_ids == ("winner",)
+        rejected = decision_by_id(plan)["duplicate"]
+        assert rejected.reason is s15.MemoryDecisionReason.DUPLICATE_CONTENT
+        assert rejected.related_memory_id == "winner"
+
+
+def test_cross_slot_duplicate_does_not_backfill_superseded_fact_under_budget(s15) -> None:
+    current = candidate(
+        s15, "current", "Use Python", authority="current_turn",
+    )
+    workspace = candidate(
+        s15, "workspace", "Use Python", authority="workspace_override",
+        conflict_key="preference:automation-language",
+    )
+    default = candidate(
+        s15, "default", "Bash", authority="user_default",
+        conflict_key="preference:automation-language",
+    )
+    # The cheaper default would fit beside current, but it has already lost
+    # its fact slot. Budget packing must not resurrect a superseded preference.
+    char_budget = len(s15.render_memory_context("scope-a", [current, default]))
+    assert len(s15.render_memory_context("scope-a", [current, workspace])) > char_budget
+    plan = s15.select_memory_context(
+        [default, workspace, current], user_scope="scope-a",
+        policy=s15.MemorySelectionPolicy(max_chars=char_budget, max_tokens=None),
+    )
+    assert plan.selected_memory_ids == ("current",)
+    decisions = decision_by_id(plan)
+    assert decisions["workspace"].reason is s15.MemoryDecisionReason.CHAR_BUDGET_EXCEEDED
+    assert decisions["default"].reason is s15.MemoryDecisionReason.AUTHORITY_LOSER
+    assert decisions["default"].related_memory_id == "workspace"
 
 
 def test_authority_precedes_score_rank_time_and_input_order(s15) -> None:

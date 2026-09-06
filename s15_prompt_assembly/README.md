@@ -167,7 +167,11 @@ Authority 不能绕过前两道门：跨 scope 或低于 `min_score` 的 `curren
 
 ### 4. Exact dedupe
 
-内容经过 NFKC、大小写折叠和空白归一化后做确定性精确去重。排序更强的候选保留，其他候选记录 `duplicate_content` 以及 winner ID。
+正文与显式 `conflict_key` 都经过 NFKC、大小写折叠和空白归一化；只有事实槽位和正文都相同才做确定性精确去重。排序更强的候选保留，其他候选记录 `duplicate_content`、winner ID 以及归一化槽位。没有 `conflict_key` 的候选只与同样没有槽位的候选去重，不会替代带槽位的记录。
+
+例如，本轮指令 A 是分析语言槽位的 `Use Python`，工作区偏好 B 是自动化语言槽位的 `Use Python`，用户默认 C 是自动化语言槽位的 `Use Bash`。A、B 正文相同，但描述不同槽位，必须都进入冲突阶段；B 随后按 authority 击败 C。如果仅按正文删除 B，C 就会错误入选。正文相同不等于可丢弃事实槽位信息。
+
+不同槽位的相同正文可能各占一份上下文预算，因为它们携带不同的事实约束与来源。若 B 最终因预算不足未入选，已经被 B 击败的 C 也不会回填；去重、冲突裁决和预算装箱仍按原有顺序执行。
 
 这里刻意不声称完成了语义去重。生产环境可以在上游增加 embedding cluster，但必须继续输出可追踪的 winner/loser 关系。
 
