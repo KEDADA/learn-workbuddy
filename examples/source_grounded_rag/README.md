@@ -74,14 +74,26 @@ Markdown heading tree
 
 ## 3. 增量索引不是简单 append
 
-`SourceIndex.sync()` 比较文档摘要：
+`SourceIndex.sync()` 比较文档摘要与生成 chunk 时的 `max_chars`：
 
-- 摘要未变：复用原有 chunk，不重复切块。
+- 摘要与切块参数都未变：复用原有 chunk，不重复切块。
+- 切块参数变化：即使正文未变，也重新切块，已有文档计入 `documents_updated`。
 - 摘要变化：替换该文档的旧 chunk。
 - 新文档：建立文档记录和 chunk。
 - 文档删除：移除活跃 chunk，并写入带 generation 的 tombstone。
 
 索引通过临时文件 + `os.replace` 原子替换，避免进程中断留下半份 JSON。tombstone 只证明“哪个版本删除过什么”，不会让已删除 chunk 继续参与检索。
+
+索引格式 v2 在顶层保存 `max_chars`，加载时不会用保存值覆盖调用方本次请求的参数。两者不匹配时，检索门禁会拒绝旧块，原因是 `chunk settings changed or unknown; sync the index first`；调用 `sync()` 后才按新参数检索。v1 索引没有保存切块参数，不能推断它使用了默认值：首次同步重新切块并写成 v2，此后参数和内容均未变就正常复用。
+
+例如，内置语料按 `max_chars=900` 建出 13 个 chunk；改为 120 后，即使复用同一个索引文件，同步结果也应与全新按 120 建索引一致，为 21 个 chunk。这里比较完整 chunk 内容、ID 和引用行号，而不只比较数量。`max_chars` 是切块目标，不是硬字符上限：单行过长时仍保留完整行；最终 Prompt 的硬预算由检索投影阶段处理。
+
+```python
+# corpus 和 index_path 分别是 Markdown 目录与索引文件的 Path。
+index = SourceIndex(corpus, index_path, max_chars=120)
+report = index.sync()  # 参数变化或旧格式会重建；相同参数可复用。
+result = OfflineBM25Retriever(index).search("memory")
+```
 
 ## 4. BM25 与 Prompt 预算是两个阶段
 

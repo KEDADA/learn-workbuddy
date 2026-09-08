@@ -94,6 +94,116 @@ def test_initial_and_unchanged_sync_reuse_chunks(rag, tmp_path: Path) -> None:
     assert second.generation == first.generation + 1
 
 
+@pytest.mark.parametrize("old_size,new_size", [(900, 120), (120, 900)])
+@pytest.mark.parametrize("restart", [False, True])
+def test_changed_chunk_size_rebuilds_unchanged_documents(
+    rag, tmp_path: Path, old_size: int, new_size: int, restart: bool,
+) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    index = rag.SourceIndex(corpus, path, max_chars=old_size)
+    index.sync()
+    previous_ids = {chunk.chunk_id for chunk in index.chunks}
+    if restart:
+        index = rag.SourceIndex(corpus, path, max_chars=new_size)
+    else:
+        index.max_chars = new_size
+
+    report = index.sync()
+    fresh = rag.SourceIndex(corpus, tmp_path / "fresh.json", max_chars=new_size)
+    fresh.sync()
+
+    assert report.documents_updated == 4
+    assert report.documents_unchanged == 0
+    assert index.chunks == fresh.chunks
+    assert {chunk.chunk_id for chunk in index.chunks} != previous_ids
+    assert all(index.validate_chunk(chunk)[0] for chunk in index.chunks)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["max_chars"] == new_size
+    reloaded = rag.SourceIndex(corpus, path, max_chars=new_size)
+    assert reloaded.sync().documents_unchanged == 4
+    assert reloaded.chunks == fresh.chunks
+
+
+def test_same_chunk_size_after_restart_reuses_chunks(rag, tmp_path: Path, monkeypatch) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    index = rag.SourceIndex(corpus, path, max_chars=120)
+    index.sync()
+    reloaded = rag.SourceIndex(corpus, path, max_chars=120)
+
+    def unexpected_rechunk(**kwargs):
+        raise AssertionError("unchanged source and settings must reuse chunks")
+
+    monkeypatch.setattr(rag, "chunk_markdown", unexpected_rechunk)
+    assert reloaded.sync().documents_unchanged == 4
+    assert reloaded.chunks == index.chunks
+
+
+def test_legacy_index_rechunks_once_without_guessing_settings(rag, tmp_path: Path) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    original = rag.SourceIndex(corpus, path, max_chars=120)
+    original.sync()
+    # Version 1 did not save the setting; its chunks need not use the default.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    payload.pop("max_chars", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    legacy = rag.SourceIndex(corpus, path, max_chars=900)
+    assert not legacy.validate_chunk(legacy.chunks[0])[0]
+    report = legacy.sync()
+    fresh = rag.SourceIndex(corpus, tmp_path / "fresh.json", max_chars=900)
+    fresh.sync()
+    assert report.documents_updated == 4
+    assert legacy.chunks == fresh.chunks
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == rag.INDEX_VERSION
+    assert rag.SourceIndex(corpus, path).sync().documents_unchanged == 4
+
+
+def test_changed_settings_require_sync_before_retrieval(rag, tmp_path: Path) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    rag.SourceIndex(corpus, path, max_chars=900).sync()
+    changed = rag.SourceIndex(corpus, path, max_chars=120)
+    result = rag.OfflineBM25Retriever(changed).search("memory")
+    assert result.hits == ()
+    assert any("chunk settings" in reason for reason in result.rejected.values())
+    changed.sync()
+    assert rag.OfflineBM25Retriever(changed).search("memory").hits
+
+
+@pytest.mark.parametrize("invalid", [True, 119, 120.5, "120", None])
+def test_chunk_settings_are_validated_at_index_boundaries(rag, tmp_path: Path, invalid) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    with pytest.raises(rag.RagContractError, match="max_chars"):
+        rag.SourceIndex(corpus, path, max_chars=invalid)
+    index = rag.SourceIndex(corpus, path)
+    index.sync()
+    index.max_chars = invalid
+    before = path.read_bytes()
+    with pytest.raises(rag.RagContractError, match="max_chars"):
+        index.sync()
+    assert path.read_bytes() == before
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["max_chars"] = invalid
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(rag.RagContractError, match="max_chars"):
+        rag.SourceIndex(corpus, path)
+
+
+def test_version_two_requires_saved_chunk_settings(rag, tmp_path: Path) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    rag.SourceIndex(corpus, path).sync()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["max_chars"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(rag.RagContractError, match="index.max_chars"):
+        rag.SourceIndex(corpus, path)
+
+
 def test_changed_document_replaces_old_chunks(rag, tmp_path: Path) -> None:
     corpus = _copy_corpus(tmp_path)
     index, _first = _index(rag, corpus, tmp_path)
@@ -280,6 +390,7 @@ def test_cli_writes_machine_readable_index_and_report(tmp_path: Path) -> None:
         (output / "source-grounded-rag-report.json").read_text(encoding="utf-8")
     )
     assert index["version"] == rag_version()
+    assert index["max_chars"] == 900
     assert len(index["documents"]) == 4
     assert any(item["unsafe_reason"] for item in index["chunks"])
     assert report["passed"] is True
@@ -288,4 +399,4 @@ def test_cli_writes_machine_readable_index_and_report(tmp_path: Path) -> None:
 
 def rag_version() -> int:
     # CLI 产物的公开格式版本保持显式，避免测试依赖导入 fixture 生命周期。
-    return 1
+    return 2
