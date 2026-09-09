@@ -382,18 +382,23 @@ class SourceIndex:
         if referenced != known_chunk_ids:
             raise RagContractError("index document/chunk references are inconsistent")
 
-    def _write(self) -> None:
+    def _write(
+        self, *, generation: int, documents: dict[str, DocumentRecord],
+        chunks: tuple[SourceChunk, ...], tombstones: list[dict],
+    ) -> None:
+        # Serialize the proposed state, not self: a failed publication must
+        # leave the live index at the last successfully published generation.
         payload = {
             "version": INDEX_VERSION,
             "max_chars": self.max_chars,
-            "generation": self.generation,
+            "generation": generation,
             "corpus_root": str(self.corpus_root),
             "documents": [
                 item.to_dict()
-                for item in sorted(self.documents.values(), key=lambda doc: doc.source_path)
+                for item in sorted(documents.values(), key=lambda doc: doc.source_path)
             ],
-            "chunks": [chunk.to_dict() for chunk in self.chunks],
-            "tombstones": self.tombstones,
+            "chunks": [chunk.to_dict() for chunk in chunks],
+            "tombstones": tombstones,
         }
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.index_path.with_suffix(self.index_path.suffix + ".tmp")
@@ -480,9 +485,12 @@ class SourceIndex:
             next_chunks.extend(document_chunks)
 
         deleted_ids = sorted(set(previous_documents) - set(next_documents))
+        # Append only to a new list. Failed attempts must neither record a
+        # deletion early nor duplicate its tombstone on a later retry.
+        next_tombstones = list(self.tombstones)
         for document_id in deleted_ids:
             old = previous_documents[document_id]
-            self.tombstones.append(
+            next_tombstones.append(
                 {
                     "document_id": document_id,
                     "source_path": old.source_path,
@@ -491,12 +499,19 @@ class SourceIndex:
                 }
             )
 
-        self.generation = next_generation
-        self.documents = next_documents
-        self.chunks = tuple(
+        published_chunks = tuple(
             sorted(next_chunks, key=lambda item: (item.source_path, item.start_line, item.chunk_id))
         )
-        self._write()
+        self._write(
+            generation=next_generation, documents=next_documents,
+            chunks=published_chunks, tombstones=next_tombstones,
+        )
+        # Disk publication is the boundary: only adopt the proposed state
+        # after it succeeds. This is a sequential sync, not a writer lock.
+        self.generation = next_generation
+        self.documents = next_documents
+        self.chunks = published_chunks
+        self.tombstones = next_tombstones
         # Mark the settings reusable only after the new index is published.
         self._indexed_max_chars = self.max_chars
         return IndexReport(

@@ -94,6 +94,78 @@ def test_initial_and_unchanged_sync_reuse_chunks(rag, tmp_path: Path) -> None:
     assert second.generation == first.generation + 1
 
 
+@pytest.mark.parametrize("failure_point", ["write", "replace"])
+@pytest.mark.parametrize("change", ["initial", "add", "update", "delete", "settings"])
+def test_failed_publication_preserves_state_and_can_retry(
+    rag, tmp_path: Path, monkeypatch, failure_point: str, change: str,
+) -> None:
+    corpus = _copy_corpus(tmp_path)
+    path = tmp_path / "index.json"
+    index = rag.SourceIndex(corpus, path)
+    if change != "initial":
+        index.sync()
+    if change == "add":
+        (corpus / "aaa-new.md").write_text("# New\n\nmemory publication\n", encoding="utf-8")
+    elif change == "update":
+        source = corpus / "layered-memory.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\nNew memory fact.\n", encoding="utf-8")
+    elif change == "delete":
+        (corpus / "layered-memory.md").unlink()
+    elif change == "settings":
+        index.max_chars = 120
+
+    def state(current):
+        # Copy mutable containers so premature mutation cannot alter the oracle.
+        return (
+            current.generation, dict(current.documents), current.chunks,
+            [dict(item) for item in current.tombstones], current._indexed_max_chars,
+        )
+
+    previous = state(index)
+    disk_before = path.read_bytes() if path.exists() else None
+    temporary = path.with_suffix(".json.tmp")
+    original_write = Path.write_text
+
+    def fail_write(target, *args, **kwargs):
+        if target == temporary:
+            # Even a partially written temporary file must not publish live state.
+            original_write(target, "{", encoding="utf-8")
+            raise OSError("injected publication failure")
+        return original_write(target, *args, **kwargs)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    with monkeypatch.context() as patch:
+        if failure_point == "write":
+            patch.setattr(Path, "write_text", fail_write)
+        else:
+            patch.setattr(rag.os, "replace", fail_replace)
+        # Retry under the same failure too: generation and tombstones must not drift.
+        for _ in range(2):
+            with pytest.raises(OSError, match="injected publication failure"):
+                index.sync()
+            assert state(index) == previous
+            assert (path.read_bytes() if path.exists() else None) == disk_before
+            reopened = rag.SourceIndex(corpus, path, max_chars=index.max_chars)
+            assert state(reopened) == previous
+            result = rag.OfflineBM25Retriever(index).search("memory")
+            assert result == rag.OfflineBM25Retriever(reopened).search("memory")
+            assert all(hit.chunk.source_path != "aaa-new.md" for hit in result.hits)
+
+    report = index.sync()
+    assert report.generation == previous[0] + 1
+    assert report.documents_added == (4 if change == "initial" else int(change == "add"))
+    assert report.documents_updated == (4 if change == "settings" else int(change == "update"))
+    assert report.documents_deleted == int(change == "delete")
+    assert report.documents_unchanged == {
+        "initial": 0, "add": 4, "update": 3, "delete": 3, "settings": 0,
+    }[change]
+    assert len(index.tombstones) == int(change == "delete")
+    assert state(rag.SourceIndex(corpus, path, max_chars=index.max_chars)) == state(index)
+    assert not temporary.exists()
+
+
 @pytest.mark.parametrize("old_size,new_size", [(900, 120), (120, 900)])
 @pytest.mark.parametrize("restart", [False, True])
 def test_changed_chunk_size_rebuilds_unchanged_documents(
